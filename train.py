@@ -1,125 +1,191 @@
 import torch
-from transformers import BertTokenizer, BertModel
-from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
-from sklearn.model_selection import train_test_split
-import logging
 import os
-
-# 设置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-class TextDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=512):
-        self.encodings = tokenizer(texts,
-                                   truncation=True,
-                                   padding=True,
-                                   max_length=max_length,
-                                   return_tensors='pt')
-
-    def __getitem__(self, idx):
-        return {key: val[idx] for key, val in self.encodings.items()}
-
-    def __len__(self):
-        return len(self.encodings.input_ids)
+import json
+from transformers import BertModel, BertTokenizer
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 
-def load_data(file_path):
-    """加载文本数据"""
+class BertWordEmbedding:
+    def __init__(self, model_name='bert-base-uncased'):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"使用设备: {self.device}")
+
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+
+    def get_word_embedding(self, corpus):
+        word_embeddings = {}
+
+        for line in corpus:
+            words = line.split()
+
+            for word in words:
+                if len(word) == 0 or word in [',', '。', '、']:
+                    continue
+
+                if word in word_embeddings:
+                    continue
+
+                try:
+                    inputs = self.tokenizer(word, return_tensors='pt', truncation=True, max_length=512).to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                        hidden_states = outputs.last_hidden_state
+
+                    word_vector = hidden_states[0].mean(dim=0).cpu().numpy()
+                    word_embeddings[word] = word_vector
+
+                except Exception as e:
+                    print(f"处理词 '{word}' 时出错: {e}")
+
+        return word_embeddings
+
+    def save_word_embeddings(self, word_embeddings, save_dir):
+        """
+        保存词向量到本地
+
+        参数:
+        - word_embeddings: 词向量字典
+        - save_dir: 保存目录
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        vectors_path = os.path.join(save_dir, 'vectors.npy')
+        np.save(vectors_path, list(word_embeddings.values()))
+
+        vocab_path = os.path.join(save_dir, 'vocab.json')
+        with open(vocab_path, 'w', encoding='utf-8') as f:
+            json.dump(list(word_embeddings.keys()), f, ensure_ascii=False)
+
+        print(f"词向量已保存到 {save_dir}")
+
+    def load_word_embeddings(self, load_dir):
+        """
+        从本地加载词向量
+
+        参数:
+        - load_dir: 加载目录
+
+        返回:
+        - word_embeddings: 词向量字典
+        """
+        vocab_path = os.path.join(load_dir, 'vocab.json')
+        with open(vocab_path, 'r', encoding='utf-8') as f:
+            vocab = json.load(f)
+
+        vectors_path = os.path.join(load_dir, 'vectors.npy')
+        vectors = np.load(vectors_path)
+
+        word_embeddings = dict(zip(vocab, vectors))
+
+        print(f"从 {load_dir} 加载词向量，共 {len(word_embeddings)} 个词")
+        return word_embeddings
+
+    def find_similar_words(self, word_embeddings, target_word, top_n=10):
+        if target_word not in word_embeddings:
+            return []
+
+        target_vector = word_embeddings[target_word].reshape(1, -1)
+
+        similarities = {}
+        for word, vector in word_embeddings.items():
+            if word == target_word:
+                continue
+
+            similarity = cosine_similarity(
+                target_vector,
+                vector.reshape(1, -1)
+            )[0][0]
+
+            similarities[word] = similarity
+
+        sorted_words = sorted(
+            similarities.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        return sorted_words[:top_n]
+
+    def visualize_word_embeddings(self, word_embeddings, top_n=500):
+        words = list(word_embeddings.keys())
+        vectors = list(word_embeddings.values())
+
+        vectors = np.array(vectors)
+
+        top_n = min(top_n, len(words))
+
+        import random
+        sample_indices = random.sample(range(len(words)), top_n)
+
+        selected_words = [words[i] for i in sample_indices]
+        selected_vectors = vectors[sample_indices]
+
+        perplexity = max(5, min(30, (top_n - 1) // 3))
+
+        tsne = TSNE(
+            n_components=2,
+            random_state=42,
+            perplexity=perplexity
+        )
+
+        reduced_vectors = tsne.fit_transform(selected_vectors)
+
+        plt.rcParams['font.family'] = 'Microsoft YaHei'
+        plt.rcParams['axes.unicode_minus'] = False
+
+        plt.figure(figsize=(15, 10))
+        plt.scatter(reduced_vectors[:, 0], reduced_vectors[:, 1], alpha=0.7)
+
+        for i, word in enumerate(selected_words):
+            plt.annotate(
+                word,
+                (reduced_vectors[i, 0], reduced_vectors[i, 1]),
+                xytext=(5, 5),
+                textcoords='offset points',
+                fontsize=9,
+                fontproperties='Microsoft YaHei'
+            )
+
+        plt.title('词向量visualize', fontproperties='Microsoft YaHei')
+        plt.xlabel('t-SNE D1', fontproperties='Microsoft YaHei')
+        plt.ylabel('t-SNE D2', fontproperties='Microsoft YaHei')
+        plt.tight_layout()
+        plt.show()
+
+
+def load_corpus(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
-        texts = f.readlines()
-    return [text.strip() for text in texts if text.strip()]
-
-
-def train_model(model, train_loader, val_loader, device, num_epochs=3):
-    """训练模型"""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
-    model.train()
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-        for batch in train_loader:
-            optimizer.zero_grad()
-
-            # 将数据移到GPU
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-
-            outputs = model(input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            output_hidden_states=True)
-
-            # 使用最后一层的隐藏状态作为词向量
-            last_hidden_states = outputs.last_hidden_state
-
-            # 这里使用MLM损失作为示例
-            # 实际应用中可以根据具体任务修改损失函数
-            loss = torch.mean((last_hidden_states * attention_mask.unsqueeze(-1)).pow(2))
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        # 验证
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-
-                outputs = model(input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                output_hidden_states=True)
-
-                last_hidden_states = outputs.last_hidden_state
-                loss = torch.mean((last_hidden_states * attention_mask.unsqueeze(-1)).pow(2))
-                val_loss += loss.item()
-
-        logger.info(f'Epoch {epoch + 1}/{num_epochs}:')
-        logger.info(f'Average training loss: {total_loss / len(train_loader)}')
-        logger.info(f'Average validation loss: {val_loss / len(val_loader)}')
-
-        model.train()
+        sentences = f.readlines()
+    return sentences
 
 
 def main():
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f'Using device: {device}')
+    corpus_path = 'data/en.txt'
 
-    # 加载tokenizer和模型
-    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
-    model = BertModel.from_pretrained('bert-base-chinese')
-    model.to(device)
+    corpus = load_corpus(corpus_path)
 
-    # 加载数据
-    texts = load_data('zh.txt')  # 替换为你的文本文件路径
+    bert_embedder = BertWordEmbedding()
 
-    # 划分训练集和验证集 (4:1)
-    train_texts, val_texts = train_test_split(texts, test_size=0.2, random_state=42)
+    word_embeddings = bert_embedder.get_word_embedding(corpus)
 
-    # 创建数据集
-    train_dataset = TextDataset(train_texts, tokenizer)
-    val_dataset = TextDataset(val_texts, tokenizer)
+    bert_embedder.save_word_embeddings(word_embeddings, save_dir='en_embeddings')
 
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8)
+    loaded_embeddings = bert_embedder.load_word_embeddings(load_dir="en_embeddings")
 
-    # 训练模型
-    train_model(model, train_loader, val_loader, device)
+    target_words = ['food', 'engineer', 'build']
+    for target_word in target_words:
+        print(f"\n与'{target_word}'相似的词:")
+        similar_words = bert_embedder.find_similar_words(loaded_embeddings, target_word)
+        for word, similarity in similar_words:
+            print(f"{word}: {similarity:.4f}")
 
-    # 保存模型
-    output_dir = './model'
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    logger.info(f'Model saved to {output_dir}')
+    bert_embedder.visualize_word_embeddings(loaded_embeddings)
 
 
 if __name__ == '__main__':
